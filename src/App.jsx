@@ -362,7 +362,8 @@ export default function App() {
       game: {
         turnTeam: 'A',
         narratorId: null,
-        endTime: null,
+        syncTimeLeft: settings ? settings.duration : 60,
+        roundId: 1,
         wordQueue: wordIndices,
         currentWordQueueIndex: 0,
         roundStats: { correct: 0, taboo: 0, pass: 0 }
@@ -710,7 +711,8 @@ function LobbyScreen({ roomData, roomId, isHost, updateRoom, myId, onLeave }) {
       state: 'PLAYING',
       'game.turnTeam': 'A',
       'game.narratorId': firstNarratorId,
-      'game.endTime': Date.now() + (roomData.settings.duration * 1000),
+      'game.syncTimeLeft': roomData.settings.duration,
+      'game.roundId': (roomData.game?.roundId || 1) + 1,
       'game.roundStats': { correct: 0, taboo: 0, pass: 0 }
     });
   };
@@ -796,10 +798,21 @@ function GameScreen({ roomData, isHost, updateRoom, myId }) {
   const isOpponent = myTeam !== game.turnTeam;
   const isTeammate = !isNarrator && !isOpponent;
 
-  const [timeLeft, setTimeLeft] = useState(0);
+  const [timeLeft, setTimeLeft] = useState(game.syncTimeLeft !== undefined ? game.syncTimeLeft : settings.duration);
   const [showShake, setShowShake] = useState(false);
+  const [localRoundId, setLocalRoundId] = useState(game.roundId);
   
   const prevStats = useRef(game.roundStats);
+  const lastSyncedTime = useRef(game.syncTimeLeft || settings.duration);
+
+  // Tur değiştiğinde yerel sayacı sıfırla
+  useEffect(() => {
+    if (game.roundId !== localRoundId) {
+      setTimeLeft(settings.duration);
+      setLocalRoundId(game.roundId);
+      lastSyncedTime.current = settings.duration;
+    }
+  }, [game.roundId, settings.duration, localRoundId]);
 
   // Sync Audio & Animations with Database changes
   useEffect(() => {
@@ -821,30 +834,49 @@ function GameScreen({ roomData, isHost, updateRoom, myId }) {
     prevStats.current = stats;
   }, [game.roundStats]);
 
-  // Timer logic
+  // Yerel Geri Sayım Mantığı (Cihaz saatine Date.now'a BAĞLI DEĞİL)
   useEffect(() => {
-    const updateTimer = () => {
-      const remaining = Math.max(0, Math.ceil((game.endTime - Date.now()) / 1000));
-      
+    const interval = setInterval(() => {
       setTimeLeft((prev) => {
-        if (remaining !== prev && remaining > 0 && remaining <= 10) {
+        if (prev <= 0) return 0;
+        const remaining = prev - 1;
+        
+        if (remaining > 0 && remaining <= 10) {
           playSound('tick');
         }
-        if (remaining === 0 && prev > 0) {
+        if (remaining === 0) {
            playSound('alarm');
+           if (isNarrator) {
+              updateRoom({ state: 'ROUND_END' });
+           }
         }
         return remaining;
       });
-      
-      if (remaining === 0 && isNarrator) {
-        updateRoom({ state: 'ROUND_END' });
-      }
-    };
+    }, 1000);
 
-    updateTimer();
-    const interval = setInterval(updateTimer, 1000);
     return () => clearInterval(interval);
-  }, [game.endTime, isNarrator, updateRoom]);
+  }, [isNarrator, updateRoom]);
+
+  // Anlatıcı her 5 saniyede bir ana sayacı veritabanına senkronize eder
+  useEffect(() => {
+    if (isNarrator && timeLeft > 0 && timeLeft % 5 === 0 && lastSyncedTime.current !== timeLeft) {
+      lastSyncedTime.current = timeLeft;
+      updateRoom({ 'game.syncTimeLeft': timeLeft });
+    }
+  }, [timeLeft, isNarrator, updateRoom]);
+
+  // Diğer oyuncular Anlatıcı'nın veritabanına gönderdiği süreyle kendilerini eşitler
+  useEffect(() => {
+    if (!isNarrator && game.syncTimeLeft !== undefined) {
+      setTimeLeft((prev) => {
+        // Eğer yerel sayaç ana sayaçtan 3 saniyeden fazla saptıysa, ana sayaca hizala
+        if (Math.abs(prev - game.syncTimeLeft) > 3) {
+          return game.syncTimeLeft;
+        }
+        return prev;
+      });
+    }
+  }, [game.syncTimeLeft, isNarrator]);
 
   const wordIndex = game.wordQueue[game.currentWordQueueIndex % game.wordQueue.length];
   const currentCard = WORD_DATABASE[wordIndex];
@@ -1027,7 +1059,8 @@ function RoundEndScreen({ roomData, isHost, updateRoom }) {
       state: 'PLAYING',
       'game.turnTeam': nextTeam,
       'game.narratorId': nextNarrator,
-      'game.endTime': Date.now() + (settings.duration * 1000),
+      'game.syncTimeLeft': settings.duration,
+      'game.roundId': (roomData.game?.roundId || 1) + 1,
       'game.roundStats': { correct: 0, taboo: 0, pass: 0 }
     });
   };
