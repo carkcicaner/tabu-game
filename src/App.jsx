@@ -350,6 +350,7 @@ export default function App() {
     // Havuz boş kalmasın diye fallback güvenlik önlemi
     const wordIndices = shuffle(availableIndices.length > 0 ? availableIndices : [0, 1, 2, 3, 4]); 
 
+    // Veritabanına gereksiz süre yazılmasını engellemek için sadece başlangıç durumlarını ayarlıyoruz
     const initialRoom = {
       id: newRoomId,
       hostId: user.uid,
@@ -362,8 +363,6 @@ export default function App() {
       game: {
         turnTeam: 'A',
         narratorId: null,
-        syncTimeLeft: settings ? settings.duration : 60,
-        roundId: 1,
         wordQueue: wordIndices,
         currentWordQueueIndex: 0,
         roundStats: { correct: 0, taboo: 0, pass: 0 }
@@ -711,8 +710,6 @@ function LobbyScreen({ roomData, roomId, isHost, updateRoom, myId, onLeave }) {
       state: 'PLAYING',
       'game.turnTeam': 'A',
       'game.narratorId': firstNarratorId,
-      'game.syncTimeLeft': roomData.settings.duration,
-      'game.roundId': (roomData.game?.roundId || 1) + 1,
       'game.roundStats': { correct: 0, taboo: 0, pass: 0 }
     });
   };
@@ -798,21 +795,20 @@ function GameScreen({ roomData, isHost, updateRoom, myId }) {
   const isOpponent = myTeam !== game.turnTeam;
   const isTeammate = !isNarrator && !isOpponent;
 
-  const [timeLeft, setTimeLeft] = useState(game.syncTimeLeft !== undefined ? game.syncTimeLeft : settings.duration);
+  // Kronometrenin takılmaması ve cihaz saatinden etkilenmemesi için Local State başlatıyoruz
+  const [timeLeft, setTimeLeft] = useState(settings.duration);
   const [showShake, setShowShake] = useState(false);
-  const [localRoundId, setLocalRoundId] = useState(game.roundId);
   
   const prevStats = useRef(game.roundStats);
-  const lastSyncedTime = useRef(game.syncTimeLeft || settings.duration);
+  const isNarratorRef = useRef(isNarrator);
+  const updateRoomRef = useRef(updateRoom);
 
-  // Tur değiştiğinde yerel sayacı sıfırla
+  // Interval içerisinde güncel veritabanı fonksiyonlarına ulaşabilmek için Ref kullanıyoruz
+  // Bu sayede butonlara tıklandığında saniye döngüsü sıfırlanmayacak ve donma engellenecek.
   useEffect(() => {
-    if (game.roundId !== localRoundId) {
-      setTimeLeft(settings.duration);
-      setLocalRoundId(game.roundId);
-      lastSyncedTime.current = settings.duration;
-    }
-  }, [game.roundId, settings.duration, localRoundId]);
+    isNarratorRef.current = isNarrator;
+    updateRoomRef.current = updateRoom;
+  }, [isNarrator, updateRoom]);
 
   // Sync Audio & Animations with Database changes
   useEffect(() => {
@@ -834,49 +830,37 @@ function GameScreen({ roomData, isHost, updateRoom, myId }) {
     prevStats.current = stats;
   }, [game.roundStats]);
 
-  // Yerel Geri Sayım Mantığı (Cihaz saatine Date.now'a BAĞLI DEĞİL)
+  // STABİL VE YEREL ZAMANLAYICI MANTIĞI
+  // Cihazın saatiyle veya veritabanıyla sürekli konuşmaz, bu yüzden asla donmaz ve şaşmaz.
   useEffect(() => {
+    const localStartTime = Date.now();
+    const totalDuration = settings.duration;
+
+    // Saniyede 4 kez kontrol eder (250ms). Böylece telefon uykuya girse bile uyandığında gerçek süreyi yakalar.
     const interval = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - localStartTime) / 1000);
+      const remaining = Math.max(0, totalDuration - elapsed);
+
       setTimeLeft((prev) => {
-        if (prev <= 0) return 0;
-        const remaining = prev - 1;
-        
-        if (remaining > 0 && remaining <= 10) {
-          playSound('tick');
-        }
-        if (remaining === 0) {
-           playSound('alarm');
-           if (isNarrator) {
-              updateRoom({ state: 'ROUND_END' });
-           }
+        if (remaining !== prev) {
+          if (remaining > 0 && remaining <= 10) {
+            playSound('tick');
+          }
+          if (remaining === 0 && prev > 0) {
+             playSound('alarm');
+             // Sadece anlatıcının telefonu süreyi bitirip veritabanına komut gönderir.
+             if (isNarratorRef.current) {
+                updateRoomRef.current({ state: 'ROUND_END' });
+             }
+          }
         }
         return remaining;
       });
-    }, 1000);
+    }, 250); 
 
+    // Ekran kapandığında (tur bittiğinde) döngü temizlenir
     return () => clearInterval(interval);
-  }, [isNarrator, updateRoom]);
-
-  // Anlatıcı her 5 saniyede bir ana sayacı veritabanına senkronize eder
-  useEffect(() => {
-    if (isNarrator && timeLeft > 0 && timeLeft % 5 === 0 && lastSyncedTime.current !== timeLeft) {
-      lastSyncedTime.current = timeLeft;
-      updateRoom({ 'game.syncTimeLeft': timeLeft });
-    }
-  }, [timeLeft, isNarrator, updateRoom]);
-
-  // Diğer oyuncular Anlatıcı'nın veritabanına gönderdiği süreyle kendilerini eşitler
-  useEffect(() => {
-    if (!isNarrator && game.syncTimeLeft !== undefined) {
-      setTimeLeft((prev) => {
-        // Eğer yerel sayaç ana sayaçtan 3 saniyeden fazla saptıysa, ana sayaca hizala
-        if (Math.abs(prev - game.syncTimeLeft) > 3) {
-          return game.syncTimeLeft;
-        }
-        return prev;
-      });
-    }
-  }, [game.syncTimeLeft, isNarrator]);
+  }, [settings.duration]);
 
   const wordIndex = game.wordQueue[game.currentWordQueueIndex % game.wordQueue.length];
   const currentCard = WORD_DATABASE[wordIndex];
@@ -1059,8 +1043,6 @@ function RoundEndScreen({ roomData, isHost, updateRoom }) {
       state: 'PLAYING',
       'game.turnTeam': nextTeam,
       'game.narratorId': nextNarrator,
-      'game.syncTimeLeft': settings.duration,
-      'game.roundId': (roomData.game?.roundId || 1) + 1,
       'game.roundStats': { correct: 0, taboo: 0, pass: 0 }
     });
   };
